@@ -1,0 +1,648 @@
+# EarnZio — Complete App Architecture & Code Guide
+
+## 📱 App Overview
+Social media + coin rewards platform built with Flutter + Firebase.
+
+---
+
+## 🗂️ Firebase Database Structure (Firestore)
+
+```
+/users/{userId}
+  ├── uid: string
+  ├── email: string
+  ├── username: string
+  ├── photoUrl: string
+  ├── bio: string
+  ├── coins: number (default: 0)
+  ├── postsToday: number (resets daily)
+  ├── lastPostDate: timestamp
+  ├── followers: number
+  ├── following: number
+  └── createdAt: timestamp
+
+/posts/{postId}
+  ├── userId: string
+  ├── username: string
+  ├── userPhotoUrl: string
+  ├── imageUrl: string
+  ├── caption: string
+  ├── likesCount: number
+  ├── commentsCount: number
+  ├── createdAt: timestamp
+  └── likes: [userId, ...]  ← for spam prevention
+
+/posts/{postId}/comments/{commentId}
+  ├── userId: string
+  ├── username: string
+  ├── text: string
+  └── createdAt: timestamp
+
+/notifications/{userId}/items/{notifId}
+  ├── type: "like" | "comment" | "follow"
+  ├── fromUser: string
+  ├── message: string
+  ├── coinsEarned: number
+  ├── read: boolean
+  └── createdAt: timestamp
+
+/follows/{followerId_followingId}
+  ├── followerId: string
+  ├── followingId: string
+  └── createdAt: timestamp
+
+/leaderboard (auto-updated via Cloud Function)
+  └── [sorted by coins descending]
+```
+
+---
+
+## 📦 pubspec.yaml Dependencies
+
+```yaml
+dependencies:
+  flutter:
+    sdk: flutter
+  firebase_core: ^2.24.0
+  firebase_auth: ^4.15.0
+  cloud_firestore: ^4.13.0
+  firebase_storage: ^11.5.0
+  google_sign_in: ^6.2.0
+  image_picker: ^1.0.7
+  cached_network_image: ^3.3.1
+  provider: ^6.1.1
+  timeago: ^3.6.1
+  flutter_animate: ^4.5.0
+  lottie: ^3.0.0
+  shimmer: ^3.0.0
+```
+
+---
+
+## 🏗️ Project Folder Structure
+
+```
+lib/
+├── main.dart
+├── firebase_options.dart
+├── models/
+│   ├── user_model.dart
+│   ├── post_model.dart
+│   └── notification_model.dart
+├── services/
+│   ├── auth_service.dart
+│   ├── coin_service.dart
+│   ├── post_service.dart
+│   └── notification_service.dart
+├── providers/
+│   ├── user_provider.dart
+│   └── feed_provider.dart
+├── screens/
+│   ├── splash_screen.dart
+│   ├── auth/
+│   │   ├── login_screen.dart
+│   │   └── signup_screen.dart
+│   ├── home/
+│   │   ├── home_screen.dart
+│   │   └── post_card.dart
+│   ├── upload/
+│   │   └── upload_screen.dart
+│   ├── profile/
+│   │   └── profile_screen.dart
+│   ├── leaderboard/
+│   │   └── leaderboard_screen.dart
+│   ├── notifications/
+│   │   └── notifications_screen.dart
+│   └── settings/
+│       └── settings_screen.dart
+└── utils/
+    ├── constants.dart
+    └── theme.dart
+```
+
+---
+
+## 🎨 Theme & Colors (utils/theme.dart)
+
+```dart
+import 'package:flutter/material.dart';
+
+class AppTheme {
+  static const Color primary = Color(0xFF3B82F6);
+  static const Color primaryDark = Color(0xFF1D4ED8);
+  static const Color background = Color(0xFF0D1426);
+  static const Color surface = Color(0xFF131D35);
+  static const Color border = Color(0xFF1E3A6E);
+  static const Color coinGold = Color(0xFFF59E0B);
+  static const Color textPrimary = Color(0xFFE2E8F0);
+  static const Color textSecondary = Color(0xFF64748B);
+
+  static ThemeData darkTheme = ThemeData(
+    brightness: Brightness.dark,
+    primaryColor: primary,
+    scaffoldBackgroundColor: background,
+    colorScheme: const ColorScheme.dark(
+      primary: primary,
+      surface: surface,
+    ),
+    fontFamily: 'PlusJakartaSans',
+  );
+}
+
+class CoinRewards {
+  static const int like = 1;
+  static const int comment = 2;
+  static const int follow = 3;
+  static const int post = 10;
+  static const int dailyPostLimit = 20;
+}
+```
+
+---
+
+## 🔐 Auth Service (services/auth_service.dart)
+
+```dart
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+class AuthService {
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
+  final GoogleSignIn _google = GoogleSignIn();
+
+  Stream<User?> get userStream => _auth.authStateChanges();
+
+  // Email Signup
+  Future<UserCredential?> signUp(String email, String password, String username) async {
+    try {
+      final cred = await _auth.createUserWithEmailAndPassword(
+        email: email, password: password,
+      );
+      await _createUserDoc(cred.user!, username);
+      return cred;
+    } catch (e) { rethrow; }
+  }
+
+  // Email Login
+  Future<UserCredential?> login(String email, String password) async {
+    return await _auth.signInWithEmailAndPassword(email: email, password: password);
+  }
+
+  // Google Sign In
+  Future<UserCredential?> googleSignIn() async {
+    final gUser = await _google.signIn();
+    if (gUser == null) return null;
+    final gAuth = await gUser.authentication;
+    final cred = GoogleAuthProvider.credential(
+      accessToken: gAuth.accessToken,
+      idToken: gAuth.idToken,
+    );
+    final result = await _auth.signInWithCredential(cred);
+    // Create doc if new user
+    final doc = await _db.collection('users').doc(result.user!.uid).get();
+    if (!doc.exists) {
+      await _createUserDoc(result.user!, gUser.displayName ?? 'User');
+    }
+    return result;
+  }
+
+  Future<void> _createUserDoc(User user, String username) async {
+    await _db.collection('users').doc(user.uid).set({
+      'uid': user.uid,
+      'email': user.email,
+      'username': username,
+      'photoUrl': user.photoURL ?? '',
+      'bio': '',
+      'coins': 50, // welcome bonus
+      'postsToday': 0,
+      'lastPostDate': FieldValue.serverTimestamp(),
+      'followers': 0,
+      'following': 0,
+      'createdAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  Future<void> signOut() async {
+    await _google.signOut();
+    await _auth.signOut();
+  }
+}
+```
+
+---
+
+## 🪙 Coin Service (services/coin_service.dart)
+
+```dart
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+class CoinService {
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
+
+  // Add coins to user
+  Future<void> addCoins(String userId, int amount, String reason) async {
+    await _db.collection('users').doc(userId).update({
+      'coins': FieldValue.increment(amount),
+    });
+  }
+
+  // Award like coins (with spam protection)
+  Future<bool> awardLike(String postId, String likerId, String postOwnerId) async {
+    if (likerId == postOwnerId) return false; // can't like own post
+
+    final postRef = _db.collection('posts').doc(postId);
+    final postDoc = await postRef.get();
+    final likes = List<String>.from(postDoc.data()?['likedBy'] ?? []);
+
+    if (likes.contains(likerId)) return false; // already liked
+
+    // Batch write for atomicity
+    final batch = _db.batch();
+    batch.update(postRef, {
+      'likesCount': FieldValue.increment(1),
+      'likedBy': FieldValue.arrayUnion([likerId]),
+    });
+    batch.update(_db.collection('users').doc(postOwnerId), {
+      'coins': FieldValue.increment(1),
+    });
+    await batch.commit();
+    return true;
+  }
+
+  // Award comment coins
+  Future<void> awardComment(String commenterId, String postOwnerId) async {
+    if (commenterId == postOwnerId) return;
+    await _db.collection('users').doc(postOwnerId).update({
+      'coins': FieldValue.increment(2),
+    });
+  }
+
+  // Award follow coins
+  Future<void> awardFollow(String followedUserId) async {
+    await _db.collection('users').doc(followedUserId).update({
+      'coins': FieldValue.increment(3),
+    });
+  }
+
+  // Award post coins (with daily limit check)
+  Future<bool> awardPost(String userId) async {
+    final userRef = _db.collection('users').doc(userId);
+    final userDoc = await userRef.get();
+    final data = userDoc.data()!;
+
+    final now = DateTime.now();
+    final lastPostDate = (data['lastPostDate'] as Timestamp?)?.toDate();
+    int postsToday = data['postsToday'] ?? 0;
+
+    // Reset daily counter if new day
+    if (lastPostDate == null || !_isSameDay(lastPostDate, now)) {
+      postsToday = 0;
+    }
+
+    if (postsToday >= 20) return false; // daily limit reached
+
+    await userRef.update({
+      'coins': FieldValue.increment(10),
+      'postsToday': postsToday + 1,
+      'lastPostDate': FieldValue.serverTimestamp(),
+    });
+    return true;
+  }
+
+  bool _isSameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+}
+```
+
+---
+
+## 📸 Post Service (services/post_service.dart)
+
+```dart
+import 'dart:io';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:uuid/uuid.dart';
+
+class PostService {
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
+  final FirebaseStorage _storage = FirebaseStorage.instance;
+
+  // Upload image & create post
+  Future<String?> createPost({
+    required String userId,
+    required String username,
+    required String userPhotoUrl,
+    required File imageFile,
+    required String caption,
+  }) async {
+    try {
+      final postId = const Uuid().v4();
+
+      // Upload image to Firebase Storage
+      final ref = _storage.ref().child('posts/$userId/$postId.jpg');
+      await ref.putFile(imageFile);
+      final imageUrl = await ref.getDownloadURL();
+
+      // Create post document
+      await _db.collection('posts').doc(postId).set({
+        'postId': postId,
+        'userId': userId,
+        'username': username,
+        'userPhotoUrl': userPhotoUrl,
+        'imageUrl': imageUrl,
+        'caption': caption,
+        'likesCount': 0,
+        'commentsCount': 0,
+        'likedBy': [],
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      return postId;
+    } catch (e) { return null; }
+  }
+
+  // Real-time feed stream
+  Stream<QuerySnapshot> getFeedStream() {
+    return _db
+        .collection('posts')
+        .orderBy('createdAt', descending: true)
+        .limit(30)
+        .snapshots();
+  }
+
+  // Add comment
+  Future<void> addComment(String postId, String userId, String username, String text) async {
+    final commentId = const Uuid().v4();
+    await _db.collection('posts').doc(postId).collection('comments').doc(commentId).set({
+      'commentId': commentId,
+      'userId': userId,
+      'username': username,
+      'text': text,
+      'createdAt': FieldValue.serverTimestamp(),
+    });
+    await _db.collection('posts').doc(postId).update({
+      'commentsCount': FieldValue.increment(1),
+    });
+  }
+
+  // Follow / Unfollow
+  Future<void> followUser(String followerId, String followingId) async {
+    final docId = '${followerId}_$followingId';
+    final ref = _db.collection('follows').doc(docId);
+    final doc = await ref.get();
+
+    final batch = _db.batch();
+    if (doc.exists) {
+      // Unfollow
+      batch.delete(ref);
+      batch.update(_db.collection('users').doc(followingId), {'followers': FieldValue.increment(-1)});
+      batch.update(_db.collection('users').doc(followerId), {'following': FieldValue.increment(-1)});
+    } else {
+      // Follow
+      batch.set(ref, {'followerId': followerId, 'followingId': followingId, 'createdAt': FieldValue.serverTimestamp()});
+      batch.update(_db.collection('users').doc(followingId), {'followers': FieldValue.increment(1)});
+      batch.update(_db.collection('users').doc(followerId), {'following': FieldValue.increment(1)});
+    }
+    await batch.commit();
+  }
+
+  // Get leaderboard
+  Stream<QuerySnapshot> getLeaderboard() {
+    return _db.collection('users').orderBy('coins', descending: true).limit(20).snapshots();
+  }
+}
+```
+
+---
+
+## 📱 Home Screen (screens/home/home_screen.dart)
+
+```dart
+import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+class HomeScreen extends StatelessWidget {
+  const HomeScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0D1426),
+      body: Column(
+        children: [
+          _buildHeader(context),
+          Expanded(
+            child: StreamBuilder<QuerySnapshot>(
+              stream: PostService().getFeedStream(),
+              builder: (ctx, snap) {
+                if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+                final posts = snap.data!.docs;
+                return ListView.builder(
+                  itemCount: posts.length,
+                  itemBuilder: (ctx, i) => PostCard(post: posts[i]),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHeader(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 50, 20, 12),
+      decoration: const BoxDecoration(
+        color: Color(0xFF0D1426),
+        border: Border(bottom: BorderSide(color: Color(0xFF1E3A6E))),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          ShaderMask(
+            shaderCallback: (b) => const LinearGradient(
+              colors: [Color(0xFF60A5FA), Color(0xFFA78BFA)],
+            ).createShader(b),
+            child: const Text('EarnZio',
+              style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800, color: Colors.white)),
+          ),
+          Row(children: [
+            IconButton(
+              icon: Stack(children: [
+                const Icon(Icons.notifications_outlined, color: Color(0xFF64748B)),
+                Positioned(top:0, right:0, child: Container(
+                  width: 8, height: 8,
+                  decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                )),
+              ]),
+              onPressed: () => Navigator.pushNamed(context, '/notifications'),
+            ),
+            IconButton(
+              icon: const Icon(Icons.add_circle_outline, color: Color(0xFF64748B)),
+              onPressed: () => Navigator.pushNamed(context, '/upload'),
+            ),
+          ]),
+        ],
+      ),
+    );
+  }
+}
+```
+
+---
+
+## ☁️ Firebase Security Rules
+
+```javascript
+// Firestore Rules
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // Users: read all, write own
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth.uid == userId;
+    }
+
+    // Posts: read all, create if auth, update own
+    match /posts/{postId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null;
+      allow update: if request.auth != null; // for likes
+      allow delete: if request.auth.uid == resource.data.userId;
+    }
+
+    // Comments: read all, write if auth
+    match /posts/{postId}/comments/{commentId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null;
+    }
+
+    // Notifications: read/write own only
+    match /notifications/{userId}/items/{notifId} {
+      allow read, write: if request.auth.uid == userId;
+    }
+  }
+}
+
+// Storage Rules
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /posts/{userId}/{postId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth.uid == userId
+        && request.resource.size < 10 * 1024 * 1024  // 10MB limit
+        && request.resource.contentType.matches('image/.*');
+    }
+    match /avatars/{userId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth.uid == userId;
+    }
+  }
+}
+```
+
+---
+
+## 🔔 Cloud Function (Auto Leaderboard + Notifications)
+
+```javascript
+// functions/index.js
+const functions = require("firebase-functions");
+const admin = require("firebase-admin");
+admin.initializeApp();
+
+const db = admin.firestore();
+
+// Send notification on like
+exports.onLike = functions.firestore
+  .document("posts/{postId}")
+  .onUpdate(async (change, context) => {
+    const before = change.before.data();
+    const after = change.after.data();
+    if (after.likesCount <= before.likesCount) return;
+
+    const postOwnerId = after.userId;
+    await db.collection("notifications")
+      .doc(postOwnerId).collection("items").add({
+        type: "like",
+        message: "Someone liked your post!",
+        coinsEarned: 1,
+        read: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+  });
+
+// Daily reset of postsToday via scheduled function
+exports.dailyReset = functions.pubsub
+  .schedule("0 0 * * *") // midnight every day
+  .onRun(async () => {
+    const batch = db.batch();
+    const users = await db.collection("users").get();
+    users.docs.forEach(doc => {
+      batch.update(doc.ref, { postsToday: 0 });
+    });
+    await batch.commit();
+  });
+```
+
+---
+
+## 🚀 Getting Started
+
+### 1. Firebase Setup
+```bash
+# Install Firebase CLI
+npm install -g firebase-tools
+firebase login
+firebase init
+
+# Enable: Firestore, Storage, Auth, Functions
+```
+
+### 2. Flutter Setup
+```bash
+flutter create earnzio
+cd earnzio
+# Add dependencies to pubspec.yaml (listed above)
+flutter pub get
+
+# Add google-services.json (Android) & GoogleService-Info.plist (iOS)
+# from Firebase Console → Project Settings
+```
+
+### 3. Run
+```bash
+flutter run
+```
+
+---
+
+## 💰 Coin Reward Summary
+
+| Action | Coins | Daily Limit |
+|--------|-------|-------------|
+| Upload Post | +10 | 20 posts/day |
+| Get a Like | +1 | Unlimited |
+| Get a Comment | +2 | Unlimited |
+| Get Followed | +3 | Unlimited |
+| Welcome Bonus | +50 | One-time |
+
+---
+
+## 🛡️ Anti-Spam / Security
+
+- **Like spam**: `likedBy` array prevents duplicate likes per user
+- **Self-like**: Blocked in CoinService (`likerId == postOwnerId`)
+- **Post limit**: 20 posts/day enforced server-side
+- **Daily reset**: Cloud Function resets counter at midnight
+- **Auth required**: All reads/writes require Firebase Auth token
+- **File size limit**: Storage rules enforce 10MB max
+
+---
+
+*EarnZio — Built with Flutter + Firebase*
